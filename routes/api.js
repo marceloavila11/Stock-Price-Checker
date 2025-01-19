@@ -1,71 +1,64 @@
 'use strict';
-const axios = require('axios');
+const fetch = require('node-fetch'); // Asegúrate de usar node-fetch@2
 const crypto = require('crypto'); // Para anonimizar IPs
-let stocksLikes = {}; // { stockSymbol: Set of hashed IPs }
+
+let likesDb = {}; // Simulación de base de datos en memoria
 
 module.exports = function (app) {
   app.route('/api/stock-prices')
     .get(async function (req, res) {
       try {
         const stock = req.query.stock;
-        const like = req.query.like === 'true';
-        const clientIp = req.ip || req.headers['x-forwarded-for'];
-        const hashedIp = crypto.createHash('sha256').update(clientIp).digest('hex');
+        const like = req.query.like === 'true'; // Determina si el usuario quiere dar un like
+        const ip = req.ip || req.connection.remoteAddress; // Obtén la IP del cliente
+        const hashedIp = crypto.createHash('sha256').update(ip).digest('hex'); // Anonimiza la IP
 
-        if (!stock) {
-          return res.status(400).json({ error: 'Missing stock query parameter' });
+        if (!stock) return res.status(400).json({ error: 'stock query parameter is required' });
+
+        const stocks = Array.isArray(stock) ? stock : [stock]; // Permite manejar uno o dos stocks
+        const results = await Promise.all(
+          stocks.map(async (s) => {
+            try {
+              const stockData = await fetch(`https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${s}/quote`)
+                .then(response => {
+                  if (!response.ok) throw new Error('Stock API error');
+                  return response.json();
+                });
+
+              if (!stockData.symbol) throw new Error('Invalid stock symbol');
+
+              likesDb[s] = likesDb[s] || { likes: new Set() }; // Inicializa el contador de likes
+              if (like) likesDb[s].likes.add(hashedIp); // Agrega un like si es requerido
+
+              return {
+                stock: stockData.symbol,
+                price: stockData.latestPrice,
+                likes: likesDb[s].likes.size
+              };
+            } catch (error) {
+              return { error: `Error fetching stock data for ${s}` };
+            }
+          })
+        );
+
+        if (results.some(result => result.error)) {
+          return res.status(500).json(results);
         }
 
-        const fetchStock = async (symbol) => {
-          const response = await axios.get(`https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${symbol}/quote`);
-          if (!response.data.symbol) {
-            throw new Error(`Invalid stock symbol: ${symbol}`);
-          }
-          return {
-            stock: response.data.symbol,
-            price: response.data.latestPrice,
-          };
-        };
-
-        const addLike = (symbol) => {
-          if (!stocksLikes[symbol]) stocksLikes[symbol] = new Set();
-          if (!stocksLikes[symbol].has(hashedIp)) {
-            stocksLikes[symbol].add(hashedIp);
-          }
-        };
-
-        if (Array.isArray(stock)) {
-          const stockData = await Promise.all(stock.map(fetchStock));
-          if (like) stock.forEach(addLike);
-
-          const relLikes = stockData.map((data, index) => ({
-            stock: data.stock,
-            price: data.price,
-            rel_likes:
-              stocksLikes[stock[index]] ? stocksLikes[stock[index]].size : 0,
-          }));
-
-          return res.json({ stockData: relLikes });
+        if (results.length === 1) {
+          res.json({ stockData: results[0] });
+        } else {
+          const rel_likes = results[0].likes - results[1].likes;
+          res.json({
+            stockData: results.map((result, idx) => ({
+              stock: result.stock,
+              price: result.price,
+              rel_likes: idx === 0 ? rel_likes : -rel_likes
+            }))
+          });
         }
-
-        const stockData = await fetchStock(stock);
-        if (like) addLike(stock);
-
-        res.json({
-          stockData: {
-            stock: stockData.stock,
-            price: stockData.price,
-            likes: stocksLikes[stock] ? stocksLikes[stock].size : 0,
-          },
-        });
       } catch (err) {
-        console.error(err.message || err);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({ error: err.message });
       }
     });
-
-  // Limpia los datos de likes para las pruebas
-  if (process.env.NODE_ENV === 'test') {
-    stocksLikes = {};
-  }
 };
